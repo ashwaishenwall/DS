@@ -1,0 +1,15 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.pem
+*.key
+.env
+__pycache__/
+.pytest_cache/
+.DS_Store
+credentials*
+admin-credentials.txt
+*.tar
+terraform/tfplan
+*.tfplan

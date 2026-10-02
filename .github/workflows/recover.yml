@@ -1,0 +1,186 @@
+name: recover-and-verify
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    environment: assessment-production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Ensure SSM role and profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          role="fynd-devsecops-ssm-role"
+          profile="fynd-devsecops-ssm-profile"
+          if ! aws iam get-role --role-name "$role" >/dev/null 2>&1; then
+            cat >/tmp/trust.json <<'JSON'
+          {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+          JSON
+            aws iam create-role --role-name "$role" --assume-role-policy-document file:///tmp/trust.json >/dev/null
+            aws iam attach-role-policy --role-name "$role" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          fi
+          if ! aws iam get-instance-profile --instance-profile-name "$profile" >/dev/null 2>&1; then
+            aws iam create-instance-profile --instance-profile-name "$profile" >/dev/null
+            aws iam add-role-to-instance-profile --role-name "$role" --instance-profile-name "$profile"
+            sleep 10
+          fi
+
+      - name: Discover existing servers
+        id: nodes
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_id="$(aws ec2 describe-instances --filters "Name=tag:Role,Values=application" "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[0].InstanceId' --output text)"
+          wazuh_id="$(aws ec2 describe-instances --filters "Name=tag:Role,Values=wazuh" "Name=instance-state-name,Values=running" --query 'Reservations[].Instances[0].InstanceId' --output text)"
+          app_ip="$(aws ec2 describe-instances --instance-ids "$app_id" --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)"
+          wazuh_ip="$(aws ec2 describe-instances --instance-ids "$wazuh_id" --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)"
+          test "$app_id" != "None" && test "$wazuh_id" != "None"
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+          echo "wazuh_id=$wazuh_id" >> "$GITHUB_OUTPUT"
+          echo "app_ip=$app_ip" >> "$GITHUB_OUTPUT"
+          echo "wazuh_ip=$wazuh_ip" >> "$GITHUB_OUTPUT"
+          echo "Found app=$app_id ($app_ip), wazuh=$wazuh_id ($wazuh_ip)"
+
+      - name: Attach SSM profile
+        shell: bash
+        env:
+          APP_ID: ${{ steps.nodes.outputs.app_id }}
+          WAZUH_ID: ${{ steps.nodes.outputs.wazuh_id }}
+        run: |
+          set -euo pipefail
+          for id in "$APP_ID" "$WAZUH_ID"; do
+            assoc="$(aws ec2 describe-iam-instance-profile-associations --filters "Name=instance-id,Values=$id" "Name=state,Values=associated" --query 'IamInstanceProfileAssociations[0].AssociationId' --output text)"
+            if [ "$assoc" = "None" ] || [ -z "$assoc" ]; then
+              aws ec2 associate-iam-instance-profile --instance-id "$id" --iam-instance-profile Name=fynd-devsecops-ssm-profile >/dev/null
+            else
+              current="$(aws ec2 describe-iam-instance-profile-associations --association-ids "$assoc" --query 'IamInstanceProfileAssociations[0].IamInstanceProfile.Arn' --output text)"
+              case "$current" in
+                *fynd-devsecops-ssm-profile) ;;
+                *) aws ec2 replace-iam-instance-profile-association --association-id "$assoc" --iam-instance-profile Name=fynd-devsecops-ssm-profile >/dev/null ;;
+              esac
+            fi
+          done
+
+      - name: Wait for SSM
+        shell: bash
+        env:
+          APP_ID: ${{ steps.nodes.outputs.app_id }}
+          WAZUH_ID: ${{ steps.nodes.outputs.wazuh_id }}
+        run: |
+          set -euo pipefail
+          for id in "$APP_ID" "$WAZUH_ID"; do
+            for i in $(seq 1 60); do
+              status="$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$id" --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)"
+              [ "$status" = "Online" ] && break
+              [ "$i" = "60" ] && { echo "SSM did not become Online for $id"; exit 1; }
+              sleep 10
+            done
+          done
+
+      - name: Reconcile Wazuh server
+        shell: bash
+        env:
+          WAZUH_ID: ${{ steps.nodes.outputs.wazuh_id }}
+        run: |
+          set -euo pipefail
+          cat >/tmp/wazuh-command.sh <<'SH'
+          if systemctl is-active --quiet wazuh-manager && systemctl is-active --quiet wazuh-indexer && systemctl is-active --quiet wazuh-dashboard && mountpoint -q /var/lib/wazuh-indexer; then exit 0; fi
+          curl -fsSL https://raw.githubusercontent.com/ashwaishenwall/DS/$GITHUB_SHA/scripts/wazuh-bootstrap.sh.tftpl -o /tmp/wazuh-bootstrap.sh.tftpl
+          sed -e 's|\${DATA_MOUNT}|/var/lib/wazuh-indexer|g' -e 's|%%{|%{|g' /tmp/wazuh-bootstrap.sh.tftpl >/tmp/wazuh-bootstrap.sh
+          chmod 700 /tmp/wazuh-bootstrap.sh
+          bash /tmp/wazuh-bootstrap.sh
+          SH
+          jq -n --arg id "$WAZUH_ID" --arg cmd "$(cat /tmp/wazuh-command.sh)" '{InstanceIds:[$id],DocumentName:"AWS-RunShellScript",Parameters:{commands:[$cmd]}}' >/tmp/ssm.json
+          cmd="$(aws ssm send-command --cli-input-json file:///tmp/ssm.json --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 120); do
+            status="$(aws ssm get-command-invocation --command-id "$cmd" --instance-id "$WAZUH_ID" --query Status --output text 2>/dev/null || true)"
+            [ "$status" = "Success" ] && exit 0
+            if [ "$status" = "Failed" ] || [ "$status" = "TimedOut" ] || [ "$status" = "Cancelled" ]; then
+              aws ssm get-command-invocation --command-id "$cmd" --instance-id "$WAZUH_ID" --output json
+              exit 1
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Reconcile application automatically
+        shell: bash
+        env:
+          APP_ID: ${{ steps.nodes.outputs.app_id }}
+          WAZUH_IP: ${{ steps.nodes.outputs.wazuh_ip }}
+        run: |
+          set -euo pipefail
+          manifest_b64="$(base64 -w0 k8s/juice-shop.yaml)"
+          reconcile_b64="$(base64 -w0 scripts/app-reconcile.sh.tftpl)"
+          cat >/tmp/app-command.sh <<SH
+          set -e
+          mkdir -p /opt/fynd-devsecops/k8s
+          echo '$manifest_b64' | base64 -d >/opt/fynd-devsecops/k8s/juice-shop.yaml
+          echo '$reconcile_b64' | base64 -d >/tmp/app-reconcile.sh.tftpl
+          sed -e 's|\${wireguard_cidr}|10.8.0.0/24|g' -e 's|\${wazuh_private_ip}|$WAZUH_IP|g' -e 's|\${project_name}|fynd-devsecops|g' /tmp/app-reconcile.sh.tftpl >/tmp/app-reconcile.sh
+          chmod 700 /tmp/app-reconcile.sh
+          bash /tmp/app-reconcile.sh
+          SH
+          jq -n --arg id "$APP_ID" --arg cmd "$(cat /tmp/app-command.sh)" '{InstanceIds:[$id],DocumentName:"AWS-RunShellScript",Parameters:{commands:[$cmd]}}' >/tmp/ssm.json
+          cmd="$(aws ssm send-command --cli-input-json file:///tmp/ssm.json --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 120); do
+            status="$(aws ssm get-command-invocation --command-id "$cmd" --instance-id "$APP_ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$status" = "Success" ]; then
+              aws ssm get-command-invocation --command-id "$cmd" --instance-id "$APP_ID" --query StandardOutputContent --output text
+              exit 0
+            fi
+            if [ "$status" = "Failed" ] || [ "$status" = "TimedOut" ] || [ "$status" = "Cancelled" ]; then
+              aws ssm get-command-invocation --command-id "$cmd" --instance-id "$APP_ID" --output json
+              exit 1
+            fi
+            sleep 10
+          done
+          exit 1
+
+      - name: Acceptance verification
+        shell: bash
+        env:
+          APP_ID: ${{ steps.nodes.outputs.app_id }}
+          WAZUH_IP: ${{ steps.nodes.outputs.wazuh_ip }}
+        run: |
+          set -euo pipefail
+          cat >/tmp/verify-command.sh <<'SH'
+          set -e
+          curl -fsSL https://raw.githubusercontent.com/ashwaishenwall/DS/$GITHUB_SHA/verifier/verifier.py -o /tmp/verifier.py
+          python3 -m pip install -q requests
+          sudo awk '/admin/{getline; print}' /opt/fynd-devsecops/admin-credentials.txt | tr -d '[:space:]' | sudo tee /tmp/indexer-password >/dev/null
+          sudo chmod 600 /tmp/indexer-password
+          python3 /tmp/verifier.py --app-url http://127.0.0.1:8080 --indexer-url https://$WAZUH_IP:9200 --indexer-user admin --indexer-password-file /tmp/indexer-password
+          rm -f /tmp/indexer-password /tmp/verifier.py
+          SH
+          jq -n --arg id "$APP_ID" --arg cmd "$(cat /tmp/verify-command.sh)" '{InstanceIds:[$id],DocumentName:"AWS-RunShellScript",Parameters:{commands:[$cmd]}}' >/tmp/verify.json
+          cmd="$(aws ssm send-command --cli-input-json file:///tmp/verify.json --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 60); do
+            status="$(aws ssm get-command-invocation --command-id "$cmd" --instance-id "$APP_ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$status" = "Success" ]; then
+              aws ssm get-command-invocation --command-id "$cmd" --instance-id "$APP_ID" --query StandardOutputContent --output text
+              exit 0
+            fi
+            if [ "$status" = "Failed" ] || [ "$status" = "TimedOut" ] || [ "$status" = "Cancelled" ]; then
+              aws ssm get-command-invocation --command-id "$cmd" --instance-id "$APP_ID" --output json
+              exit 1
+            fi
+            sleep 10
+          done
+          exit 1

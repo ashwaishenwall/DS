@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec > >(tee -a /var/log/fynd-app-reconcile.log) 2>&1
+
+log() {
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+}
+
+WAZUH_PRIVATE_IP="${wazuh_private_ip}"
+PROJECT_NAME="${project_name}"
+WIREGUARD_CIDR="${wireguard_cidr}"
+
+apt-get update
+apt-get install -y curl ca-certificates gnupg jq docker.io docker-compose-v2 wireguard iptables python3 python3-pip python3-requests
+systemctl enable --now docker
+
+groupadd --force docker
+usermod -aG docker ubuntu || true
+if [ -S /var/run/docker.sock ]; then
+  chown root:docker /var/run/docker.sock || true
+  chmod 660 /var/run/docker.sock || true
+fi
+su - ubuntu -c 'docker info >/dev/null' || true
+until docker info >/dev/null 2>&1; do sleep 2; done
+
+if ! command -v kubectl >/dev/null 2>&1 || ! systemctl is-active --quiet k3s; then
+  curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --write-kubeconfig-mode=644" sh -
+fi
+systemctl enable --now k3s
+until kubectl get nodes --no-headers 2>/dev/null | grep -q ' Ready '; do sleep 3; done
+
+mkdir -p /opt/fynd-devsecops/k8s /opt/fynd-devsecops/waf /opt/fynd-devsecops/state /var/log
+
+# Canonical manifest is the repository source of truth and is copied to /opt/fynd-devsecops/k8s/juice-shop.yaml by bootstrap.
+# Apply it directly without deleting or force-terminating the deployment.
+log "Applying canonical Juice Shop manifest"
+kubectl apply -f /opt/fynd-devsecops/k8s/juice-shop.yaml
+
+if ! kubectl -n juice-shop rollout status deployment/juice-shop --timeout=300s; then
+  kubectl -n juice-shop get pods -o wide || true
+  kubectl -n juice-shop describe pods || true
+  kubectl -n juice-shop logs -l app=juice-shop --all-containers=true --tail=200 || true
+  exit 1
+fi
+
+kubectl -n juice-shop get deployment
+kubectl -n juice-shop get pods
+kubectl -n juice-shop get svc
+
+JUICE_IP="$(kubectl -n juice-shop get svc juice-shop -o jsonpath='{.spec.clusterIP}')"
+until curl -fsS "http://$JUICE_IP:3000/" >/dev/null; do sleep 3; done
+
+cat >/opt/fynd-devsecops/waf/docker-compose.yml <<COMPOSE
+services:
+  waf:
+    image: owasp/modsecurity-crs:nginx
+    container_name: fynd-waf
+    restart: unless-stopped
+    environment:
+      BACKEND: "http://$JUICE_IP:3000"
+      PORT: "8080"
+      MODSEC_RULE_ENGINE: "On"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8080:8080"
+COMPOSE
+
+cd /opt/fynd-devsecops/waf
+docker compose up -d
+until [ "$(docker inspect -f '{{.State.Running}}' fynd-waf 2>/dev/null || true)" = "true" ]; do sleep 3; done
+until curl -fsS http://127.0.0.1:8080/ >/dev/null; do sleep 3; done
+normal_code="$(curl -sS -o /dev/null -w '%%{http_code}' 'http://127.0.0.1:8080/')"
+malicious_code="$(curl -sS -o /dev/null -w '%%{http_code}' 'http://127.0.0.1:8080/?id=1%20OR%201%3D1')"
+if [ "$normal_code" = "200" ] || [ "$normal_code" = "302" ] || [ "$normal_code" = "403" ]; then
+  :
+else
+  echo "Normal WAF request failed with HTTP $normal_code"
+  exit 1
+fi
+if [ "$malicious_code" != "403" ]; then
+  echo "Malicious WAF request expected HTTP 403, got $malicious_code"
+  exit 1
+fi
+
+mkdir -p /opt/fynd-devsecops
+: > /opt/fynd-devsecops/waf-access.log
+chmod 640 /opt/fynd-devsecops/waf-access.log
+cat >/usr/local/bin/fynd-waf-log-bridge.sh <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+LOG_FILE="/opt/fynd-devsecops/waf-access.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 640 "$LOG_FILE"
+exec docker logs -f --since 1s fynd-waf 2>&1 | while IFS= read -r line; do printf '%s\n' "$line" >> "$LOG_FILE"; done
+EOF
+chmod 750 /usr/local/bin/fynd-waf-log-bridge.sh
+cat >/etc/systemd/system/fynd-waf-log-bridge.service <<'EOF'
+[Unit]
+Description=Fynd WAF Docker log bridge
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fynd-waf-log-bridge.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now fynd-waf-log-bridge.service
+systemctl is-active --quiet fynd-waf-log-bridge.service
+
+install -d -m 0700 /etc/wireguard
+umask 077
+if [ ! -s /etc/wireguard/server.key ]; then wg genkey >/etc/wireguard/server.key; fi
+wg pubkey </etc/wireguard/server.key >/etc/wireguard/server.pub
+DEFAULT_IFACE="$(ip route show default | awk 'NR==1{print $5}')"
+cat >/etc/sysctl.d/99-fynd-wireguard.conf <<EOF
+net.ipv4.ip_forward=1
+EOF
+sysctl --system >/dev/null
+cat >/etc/wireguard/wg0.conf <<EOF
+[Interface]
+Address = 10.8.0.1/24
+ListenPort = 51820
+PrivateKey = $(cat /etc/wireguard/server.key)
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s $WIREGUARD_CIDR -o $DEFAULT_IFACE -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s $WIREGUARD_CIDR -o $DEFAULT_IFACE -j MASQUERADE
+EOF
+systemctl enable --now wg-quick@wg0
+
+curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import
+chmod 644 /usr/share/keyrings/wazuh.gpg
+cat >/etc/apt/sources.list.d/wazuh.list <<EOF
+deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main
+EOF
+apt-get update
+if [ ! -x /var/ossec/bin/wazuh-agentd ]; then
+  WAZUH_MANAGER="$WAZUH_PRIVATE_IP" WAZUH_REGISTRATION_SERVER="$WAZUH_PRIVATE_IP" WAZUH_AGENT_NAME="$PROJECT_NAME-app" apt-get install -y wazuh-agent
+fi
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+p = Path('/var/ossec/etc/ossec.conf')
+s = p.read_text()
+
+docker_pattern = r'\s*<localfile>\s*<location>/var/lib/docker/containers/.*/\*-json\.log</location>\s*<log_format>json</log_format>\s*</localfile>\s*'
+legacy_waf_pattern = r'\s*<localfile>\s*<location>(?:/opt/fynd/devsecops/(?:logs/access\.log|waf-access\.log)|/opt/fynd-devsecops/waf-access\.log)</location>\s*<log_format>(?:apache|json)</log_format>\s*</localfile>\s*'
+
+# Remove all stale or duplicate blocks before re-adding the canonical single Docker JSON collector.
+s = re.sub(docker_pattern, '', s, flags=re.MULTILINE)
+s = re.sub(legacy_waf_pattern, '', s, flags=re.MULTILINE)
+
+if not re.search(r'/var/lib/docker/containers/.*/\*-json\.log', s):
+    s = s.replace(
+        '</ossec_config>',
+        '  <localfile>\n'
+        '    <location>/var/lib/docker/containers/*/*-json.log</location>\n'
+        '    <log_format>json</log_format>\n'
+        '  </localfile>\n'
+        '</ossec_config>',
+        1,
+    )
+
+p.write_text(s)
+PY
+/var/ossec/bin/wazuh-agentd -t
+systemctl enable --now wazuh-agent
+systemctl restart wazuh-agent
+systemctl is-active --quiet wazuh-agent
+
+cat >/opt/fynd-devsecops/state/environment.env <<EOF
+WAZUH_PRIVATE_IP=$WAZUH_PRIVATE_IP
+APP_PRIVATE_IP=$(hostname -I | awk '{print $1}')
+APP_PUBLIC_IP=$(curl -s --max-time 5 http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+WIREGUARD_PUBLIC_KEY=$(cat /etc/wireguard/server.pub)
+EOF
+chmod 640 /opt/fynd-devsecops/state/environment.env
+
+if ! systemctl is-active --quiet docker; then exit 1; fi
+if ! systemctl is-active --quiet k3s; then exit 1; fi
+if ! systemctl is-active --quiet wazuh-agent; then exit 1; fi
+if [ "$(curl -sS -o /dev/null -w '%%{http_code}' 'http://127.0.0.1:8080/')" != "200" ] && [ "$(curl -sS -o /dev/null -w '%%{http_code}' 'http://127.0.0.1:8080/')" != "302" ]; then exit 1; fi
+if [ "$(curl -sS -o /dev/null -w '%%{http_code}' 'http://127.0.0.1:8080/?id=1%20OR%201%3D1')" != "403" ]; then exit 1; fi
+if ! systemctl is-active --quiet fynd-waf-log-bridge.service; then exit 1; fi
+
+touch /opt/fynd-devsecops/state/app-ready
+chmod 600 /opt/fynd-devsecops/state/app-ready
+log "APP RECONCILIATION COMPLETE"
+##

@@ -1,0 +1,688 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec > >(tee -a /var/log/fynd-wazuh-bootstrap.log) 2>&1
+
+log() {
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a /var/log/fynd-wazuh-bootstrap.log
+}
+
+trap 'log "ERROR: bootstrap failed at line $${LINENO}: $${BASH_COMMAND}" >&2; exit 1' ERR
+
+export DEBIAN_FRONTEND=noninteractive
+
+log "Starting Wazuh bootstrap"
+
+# Cloud-init and package upgrades can still be running on an existing VM.
+# Wait for apt/dpkg locks before starting the idempotent repair.
+for i in $(seq 1 60); do
+  if ! fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+dpkg --configure -a || true
+
+apt-get update
+apt-get install -y curl ca-certificates gnupg jq rsync
+
+log "OS packages installed"
+
+DATA_MOUNT="/var/lib/wazuh-indexer"
+DATA_STAGE="/mnt/fynd-wazuh-indexer-data"
+MARKER="$${DATA_MOUNT}/.fynd-wazuh-install-success"
+
+mkdir -p "$DATA_STAGE"
+
+###############################################################################
+# FIND PERSISTENT EBS DEVICE
+###############################################################################
+
+ROOT_SOURCE="$(findmnt -n -o SOURCE /)"
+ROOT_DISK="$(lsblk -ndo PKNAME "$ROOT_SOURCE" 2>/dev/null || true)"
+
+DATA_DEV=""
+
+# If the EBS volume is already mounted at the Wazuh data path, reuse it.
+if mountpoint -q "$DATA_MOUNT"; then
+  DATA_DEV="$(findmnt -n -o SOURCE "$DATA_MOUNT")"
+fi
+
+# Otherwise find the non-root unmounted disk.
+if [ -z "$DATA_DEV" ]; then
+  while read -r name type; do
+    [ "$type" = "disk" ] || continue
+
+    if [ "$name" = "$ROOT_DISK" ]; then
+      continue
+    fi
+
+    if lsblk -no MOUNTPOINT "$name" 2>/dev/null | grep -q '[^[:space:]]'; then
+      continue
+    fi
+
+    DATA_DEV="/dev/$name"
+    break
+  done < <(lsblk -ndo NAME,TYPE)
+fi
+
+if [ -z "$DATA_DEV" ]; then
+  log "ERROR: dedicated persistent EBS data disk was not detected"
+  exit 1
+fi
+
+log "Persistent Wazuh data device detected: $DATA_DEV"
+
+###############################################################################
+# PREPARE EBS FILESYSTEM
+###############################################################################
+
+if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
+  log "Formatting new persistent EBS device: $DATA_DEV"
+  mkfs.ext4 -F "$DATA_DEV"
+fi
+
+UUID="$(blkid -s UUID -o value "$DATA_DEV")"
+
+if [ -z "$UUID" ]; then
+  log "ERROR: unable to determine UUID for $DATA_DEV"
+  exit 1
+fi
+
+log "Persistent EBS UUID: $UUID"
+
+###############################################################################
+# MOUNT EBS TEMPORARILY TO INSPECT PERSISTENT STATE
+###############################################################################
+
+mkdir -p "$DATA_STAGE"
+
+# If EBS is not already mounted at the final Wazuh data path,
+# mount it temporarily so we can inspect persistent state.
+if ! mountpoint -q "$DATA_MOUNT"; then
+
+  if ! mountpoint -q "$DATA_STAGE"; then
+    mount "$DATA_DEV" "$DATA_STAGE"
+  fi
+
+  log "Persistent EBS mounted temporarily at $DATA_STAGE"
+fi
+
+###############################################################################
+# DETERMINE WHETHER THIS IS AN EXISTING WAZUH DEPLOYMENT
+###############################################################################
+
+PERSISTENT_MARKER="$DATA_STAGE/.fynd-wazuh-install-success"
+
+if mountpoint -q "$DATA_MOUNT"; then
+  PERSISTENT_MARKER="$DATA_MOUNT/.fynd-wazuh-install-success"
+fi
+
+###############################################################################
+# EXISTING HEALTHY DEPLOYMENT
+###############################################################################
+
+is_wazuh_healthy() {
+
+  for svc in wazuh-indexer wazuh-manager wazuh-dashboard; do
+    systemctl is-active --quiet "$svc" || return 1
+  done
+
+  IDX_CODE="$(
+    curl -k -s -o /dev/null -w "%%{http_code}" \
+      --max-time 10 \
+      https://127.0.0.1:9200 || echo "000"
+  )"
+
+  case "$IDX_CODE" in
+    200|401)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  DASH_CODE="$(
+    curl -k -s -o /dev/null -w "%%{http_code}" \
+      --max-time 10 \
+      https://127.0.0.1/ || echo "000"
+  )"
+
+  case "$DASH_CODE" in
+    200|302)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+###############################################################################
+# HANDLE EXISTING PERSISTENT INSTALLATION
+###############################################################################
+
+if [ -f "$PERSISTENT_MARKER" ] || { mountpoint -q "$DATA_MOUNT" && systemctl is-active --quiet wazuh-indexer; }; then
+
+  if [ -f "$PERSISTENT_MARKER" ]; then
+    log "Persistent Wazuh success marker detected"
+  else
+    log "Existing healthy Wazuh deployment detected without marker; preserving installation"
+  fi
+
+  # If the EBS is currently mounted somewhere else, move it to the final path.
+  if ! mountpoint -q "$DATA_MOUNT"; then
+
+    if mountpoint -q "$DATA_STAGE"; then
+      umount "$DATA_STAGE"
+    fi
+
+    mkdir -p "$DATA_MOUNT"
+
+    mount "$DATA_DEV" "$DATA_MOUNT"
+
+    log "Persistent EBS mounted at $DATA_MOUNT"
+  fi
+
+  if is_wazuh_healthy; then
+    log "Existing Wazuh deployment is healthy; skipping installation"
+  else
+    log "Existing Wazuh marker found but Wazuh services are unhealthy"
+    log "Continuing with configuration/healthcheck repair"
+  fi
+
+else
+
+  log "No persistent Wazuh success marker found"
+  log "Starting fresh/partial installation workflow"
+
+  #############################################################################
+  # FRESH INSTALLATION
+  #############################################################################
+
+  # Unmount temporary EBS before running the official installer.
+  # This prevents the installer from detecting /var/lib/wazuh-indexer
+  # as pre-existing indexer state.
+  if mountpoint -q "$DATA_STAGE"; then
+    umount "$DATA_STAGE"
+  fi
+
+  if mountpoint -q "$DATA_MOUNT"; then
+    umount "$DATA_MOUNT"
+  fi
+
+  # Make sure the target mountpoint does not exist during installation.
+  if [ -d "$DATA_MOUNT" ]; then
+
+    if [ -z "$(ls -A "$DATA_MOUNT" 2>/dev/null)" ]; then
+      rmdir "$DATA_MOUNT" 2>/dev/null || true
+    else
+      log "Existing local Wazuh indexer directory detected"
+
+      # If packages exist, this is likely a partial installation.
+      if dpkg-query -W -f='$${Status}' wazuh-indexer 2>/dev/null |
+        grep -q "install ok installed"; then
+
+        log "Removing partial Wazuh installation artifacts"
+
+        for svc in wazuh-indexer wazuh-manager wazuh-dashboard filebeat; do
+          systemctl stop "$svc" >/dev/null 2>&1 || true
+        done
+
+        for pkg in wazuh-indexer wazuh-manager wazuh-dashboard filebeat; do
+          dpkg --purge --force-all "$pkg" >/dev/null 2>&1 || true
+        done
+
+        rm -rf \
+          /var/ossec \
+          /etc/ossec \
+          /etc/wazuh \
+          /etc/filebeat \
+          /etc/wazuh-indexer \
+          /etc/wazuh-dashboard \
+          /usr/share/wazuh-manager \
+          /usr/share/wazuh-indexer \
+          /usr/share/wazuh-dashboard \
+          /var/lib/filebeat \
+          /var/lib/wazuh-dashboard \
+          /var/log/wazuh-indexer \
+          /var/log/wazuh-dashboard \
+          /var/log/filebeat \
+          /run/wazuh-dashboard \
+          /opt/wazuh \
+          /tmp/wazuh-install.sh \
+          /tmp/wazuh-install-files.tar
+
+        systemctl daemon-reload || true
+      fi
+
+      if [ -d "$DATA_MOUNT" ] &&
+         [ -z "$(ls -A "$DATA_MOUNT" 2>/dev/null)" ]; then
+        rmdir "$DATA_MOUNT" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  ###########################################################################
+  # RUN OFFICIAL WAZUH ASSISTED INSTALLER
+  ###########################################################################
+
+  log "Downloading Wazuh assisted installer"
+
+  curl -fsSLO https://packages.wazuh.com/4.14/wazuh-install.sh
+
+  chmod 744 wazuh-install.sh
+
+  log "Running Wazuh assisted installer"
+
+  bash ./wazuh-install.sh -a
+
+  log "Wazuh assisted installer completed"
+
+# The assisted installer can leave OpenSearch Security uninitialized on a
+# fresh single-node deployment. Initialize it non-interactively when needed.
+systemctl daemon-reload || true
+systemctl restart wazuh-indexer || true
+for i in $(seq 1 30); do
+  IDX_CODE="$(curl -k -s -o /dev/null -w '%%{http_code}' --max-time 5 https://127.0.0.1:9200 || echo 000)"
+  [ "$IDX_CODE" = "503" ] || [ "$IDX_CODE" = "200" ] || [ "$IDX_CODE" = "401" ] || true
+  if [ "$IDX_CODE" != "503" ] && [ "$IDX_CODE" != "000" ]; then break; fi
+  sleep 5
+done
+
+if [ "$IDX_CODE" = "503" ] && [ -x /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh ]; then
+  log "Initializing OpenSearch Security configuration"
+  OPENSEARCH_JAVA_HOME=/usr/share/wazuh-indexer/jdk     /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh     -cd /etc/wazuh-indexer/opensearch-security/     -icl -nhnv     -key /etc/wazuh-indexer/certs/admin-key.pem     -cert /etc/wazuh-indexer/certs/admin.pem     -cacert /etc/wazuh-indexer/certs/root-ca.pem     -h 127.0.0.1
+fi
+
+
+  ###########################################################################
+  # STOP INDEXER BEFORE MOVING DATA TO EBS
+  ###########################################################################
+
+  systemctl stop wazuh-indexer
+
+  log "Wazuh Indexer stopped for persistent data migration"
+
+  ###########################################################################
+  # MOUNT EBS TEMPORARILY
+  ###########################################################################
+
+  mkdir -p "$DATA_STAGE"
+
+  if ! mountpoint -q "$DATA_STAGE"; then
+    mount "$DATA_DEV" "$DATA_STAGE"
+  fi
+
+  ###########################################################################
+  # COPY INDEXER DATA TO PERSISTENT EBS
+  ###########################################################################
+
+  if [ -d "$DATA_MOUNT" ]; then
+
+    log "Copying Wazuh Indexer data to persistent EBS"
+
+    rsync -aHAX \
+      "$DATA_MOUNT/" \
+      "$DATA_STAGE/"
+  fi
+
+  ###########################################################################
+  # PRESERVE SUCCESS MARKER LOCATION
+  ###########################################################################
+
+  rm -rf "$DATA_STAGE/.fynd-wazuh-install-success"
+
+  ###########################################################################
+  # REMOVE ORIGINAL INDEXER DATA DIRECTORY
+  ###########################################################################
+
+  rm -rf "$DATA_MOUNT"
+
+  mkdir -p "$DATA_MOUNT"
+
+  ###########################################################################
+  # MOUNT EBS AT REAL WAZUH INDEXER DATA PATH
+  ###########################################################################
+
+  umount "$DATA_STAGE"
+
+  mount "$DATA_DEV" "$DATA_MOUNT"
+
+  chown -R wazuh-indexer:wazuh-indexer "$DATA_MOUNT"
+  chmod 750 "$DATA_MOUNT"
+  systemctl daemon-reload || true
+  systemctl start wazuh-indexer
+
+  log "Persistent EBS mounted at $DATA_MOUNT and Wazuh Indexer restarted"
+
+fi
+
+# Ensure the persistent mount has the ownership expected by OpenSearch/Wazuh.
+chown -R wazuh-indexer:wazuh-indexer "$DATA_MOUNT"
+chmod 750 "$DATA_MOUNT"
+systemctl daemon-reload || true
+systemctl start wazuh-indexer || true
+
+###############################################################################
+# PERSISTENT FSTAB ENTRY
+###############################################################################
+
+if ! grep -q "UUID=$UUID $DATA_MOUNT ext4 defaults,nofail 0 2" /etc/fstab; then
+
+  echo "UUID=$UUID $DATA_MOUNT ext4 defaults,nofail 0 2" \
+    >> /etc/fstab
+
+fi
+
+log "Persistent EBS fstab entry configured"
+
+###############################################################################
+# VERIFY DATA MOUNT
+###############################################################################
+
+if ! mountpoint -q "$DATA_MOUNT"; then
+  log "ERROR: Wazuh persistent EBS is not mounted at $DATA_MOUNT"
+  exit 1
+fi
+
+log "Verified persistent Wazuh data mount"
+
+###############################################################################
+# CREATE PROJECT DIRECTORY
+###############################################################################
+
+mkdir -p /opt/fynd-devsecops
+chmod 700 /opt/fynd-devsecops
+
+###############################################################################
+# COPY INSTALL CREDENTIAL ARCHIVE
+###############################################################################
+
+if [ -f wazuh-install-files.tar ]; then
+
+  cp -f \
+    wazuh-install-files.tar \
+    /opt/fynd-devsecops/wazuh-install-files.tar
+
+  chmod 600 \
+    /opt/fynd-devsecops/wazuh-install-files.tar
+
+fi
+
+###############################################################################
+# CUSTOM WAZUH RULE (ACTIVE RULE FILE ONLY; PRESERVE EXISTING RULES)
+###############################################################################
+install_fynd_wazuh_rule() {
+  local rules_file="/var/ossec/etc/rules/local_rules.xml"
+
+  python3 - "$rules_file" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+rules_file = Path(sys.argv[1])
+rule_100100 = '''  <rule id="100100" level="7">
+    <if_sid>31100</if_sid>
+    <match>FYND_VERIFIER_MARKER-</match>
+    <description>Fynd DevSecOps verifier marker observed in WAF access log</description>
+    <group>web,devsecops,</group>
+  </rule>
+'''
+
+rule_100101 = '''  <rule id="100101" level="7">
+    <match>SQL Injection Attack Detected via libinjection|942100|949110|ruleId\":\"942100\"|ruleId\":\"949110\"</match>
+    <description>ModSecurity SQL injection event detected in WAF Docker JSON log</description>
+    <group>web,attack,sql_injection,modsecurity,</group>
+  </rule>
+'''
+
+if not rules_file.exists():
+    rules_file.write_text('<group name="local,">\n</group>\n', encoding='utf-8')
+
+text = rules_file.read_text(encoding='utf-8')
+for rule_id, rule_block in [('100100', rule_100100), ('100101', rule_100101)]:
+    text = re.sub(rf'\n?\s*<rule id="{rule_id}".*?</rule>\s*', '\n', text, flags=re.S)
+    if f'id="{rule_id}"' not in text:
+        if '<group name="local,"' in text:
+            text = text.replace('</group>', rule_block + '</group>', 1)
+        else:
+            text = '<group name="local,">\n' + rule_block + '</group>\n'
+
+rules_file.write_text(text, encoding='utf-8')
+PY
+
+  chmod 640 "$rules_file"
+  chown root:wazuh "$rules_file" 2>/dev/null || true
+}
+
+# Always enforce the active custom rules on fresh installs. This must happen
+# before the manager is restarted so the rule is present in local_rules.xml.
+install_fynd_wazuh_rule
+
+###############################################################################
+# LEGACY COMPATIBILITY FILE (kept for traceability, not relied on for active rule loading)
+###############################################################################
+cat >/var/ossec/etc/rules/fynd_devsecops_rules.xml <<'EOF'
+<group name="fynd_devsecops,">
+  <rule id="100100" level="7">
+    <if_sid>31100</if_sid>
+    <match>FYND_VERIFIER_MARKER-</match>
+    <description>Fynd DevSecOps verifier marker observed in WAF access log</description>
+    <group>web,devsecops,</group>
+  </rule>
+
+  <rule id="100101" level="7">
+    <match>SQL Injection Attack Detected via libinjection|942100|949110|ruleId\":\"942100\"|ruleId\":\"949110\"</match>
+    <description>ModSecurity SQL injection event detected in WAF Docker JSON log</description>
+    <group>web,attack,sql_injection,modsecurity,</group>
+  </rule>
+</group>
+EOF
+
+# Ensure the active file also contains the rule after any local changes.
+install_fynd_wazuh_rule
+
+###############################################################################
+# CONFIGURE WAF LOG COLLECTION
+###############################################################################
+
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+p = Path("/var/ossec/etc/ossec.conf")
+
+s = p.read_text()
+
+pattern = (
+    r'\s*<localfile>\s*'
+    r'<location>/opt/fynd-devsecops/waf-access\.log</location>\s*'
+    r'<log_format>syslog</log_format>\s*'
+    r'</localfile>\s*'
+)
+
+s = re.sub(
+    pattern,
+    '',
+    s,
+    flags=re.MULTILINE
+)
+
+block = """
+  <localfile>
+    <location>/opt/fynd-devsecops/waf-access.log</location>
+    <log_format>syslog</log_format>
+  </localfile>
+"""
+
+if "/opt/fynd-devsecops/waf-access.log" not in s:
+    s = s.replace(
+        "</ossec_config>",
+        block + "\n</ossec_config>"
+    )
+
+p.write_text(s)
+PY
+
+# Preserve the existing Wazuh archive configuration. Remove only invalid
+# top-level logall tags left by an older repair; do not inject unsupported
+# options into the manager configuration.
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path("/var/ossec/etc/ossec.conf")
+s = p.read_text()
+for tag in ("logall", "logall_json"):
+    s = re.sub(rf"\s*<{tag}>[^<]*</{tag}>\s*", "\n", s)
+p.write_text(s)
+PY
+
+sed -i '/<logall>/d; /<logall_json>/d' /var/ossec/etc/ossec.conf
+
+touch /opt/fynd-devsecops/waf-access.log
+
+###############################################################################
+# VALIDATE WAZUH CONFIG
+###############################################################################
+
+if ! /var/ossec/bin/wazuh-analysisd -t; then
+  log "ERROR: Wazuh analysis configuration validation failed"
+  exit 1
+fi
+
+log "Wazuh configuration validation passed"
+
+###############################################################################
+# WAIT FOR INDEXER READY BEFORE MANAGER STARTUP
+###############################################################################
+
+if ! wait_for_indexer_ready; then
+  log "ERROR: wazuh-indexer is still unavailable before manager startup"
+  exit 1
+fi
+
+log "Wazuh indexer ready; starting manager"
+
+###############################################################################
+# RESTART WAZUH MANAGER
+###############################################################################
+
+systemctl daemon-reload || true
+systemctl restart wazuh-manager
+
+# Ensure the manager is ready to receive/forward agent events before the
+# deployment wrapper publishes the Wazuh-ready marker.
+for i in $(seq 1 30); do
+  systemctl is-active --quiet wazuh-manager && break
+  sleep 2
+done
+
+systemctl is-active --quiet wazuh-manager || {
+  log "ERROR: wazuh-manager failed to start"
+  exit 1
+}
+
+log "Wazuh manager restarted successfully"
+
+###############################################################################
+# SAVE ADMIN CREDENTIALS
+###############################################################################
+
+if [ -f /opt/fynd-devsecops/wazuh-install-files.tar ]; then
+
+  tar -axf \
+    /opt/fynd-devsecops/wazuh-install-files.tar \
+    wazuh-install-files/wazuh-passwords.txt \
+    -O \
+    | grep -P "'admin'" -A 1 \
+    >/opt/fynd-devsecops/admin-credentials.txt
+
+  chmod 600 \
+    /opt/fynd-devsecops/admin-credentials.txt
+
+fi
+
+###############################################################################
+# WAZUH HEALTHCHECK
+###############################################################################
+
+cat >/opt/fynd-devsecops/healthcheck.sh <<'EOF'
+#!/usr/bin/env bash
+set -e
+
+for svc in wazuh-manager wazuh-indexer wazuh-dashboard; do
+
+  systemctl is-active --quiet "$svc" || {
+    echo "ERROR: $svc is not active"
+    exit 1
+  }
+
+done
+
+# Indexer:
+# 200 = reachable
+# 401 = reachable and authentication is enforced
+
+IDX_CODE=$(curl -k -s -o /dev/null -w '%%{http_code}' \
+  --max-time 10 \
+  https://127.0.0.1:9200 || echo "000")
+
+if [ "$IDX_CODE" != "200" ] &&
+   [ "$IDX_CODE" != "401" ]; then
+
+  echo "ERROR: Indexer HTTP status $IDX_CODE"
+  exit 1
+
+fi
+
+# Dashboard:
+# 200 = reachable
+# 302 = reachable and redirecting to login
+
+DASH_CODE=$(curl -k -s -o /dev/null -w '%%{http_code}' \
+  --max-time 10 \
+  https://127.0.0.1/ || echo "000")
+
+if [ "$DASH_CODE" != "200" ] &&
+   [ "$DASH_CODE" != "302" ]; then
+
+  echo "ERROR: Dashboard HTTP status $DASH_CODE"
+  exit 1
+
+fi
+
+echo "Wazuh healthcheck passed"
+EOF
+
+chmod 750 /opt/fynd-devsecops/healthcheck.sh
+
+###############################################################################
+# FINAL HEALTHCHECK
+###############################################################################
+
+if ! /opt/fynd-devsecops/healthcheck.sh; then
+
+  log "ERROR: final Wazuh healthcheck failed"
+
+  exit 1
+
+fi
+
+log "Final Wazuh healthcheck passed"
+
+# This marker is consumed by deploy.sh and is only written after the complete
+# Wazuh stack and healthcheck are ready.
+touch /opt/fynd-devsecops/wazuh-ready
+chmod 600 /opt/fynd-devsecops/wazuh-ready
+
+###############################################################################
+# SUCCESS MARKER
+###############################################################################
+
+touch "$MARKER"
+
+chmod 600 "$MARKER"
+
+log "Wazuh bootstrap completed successfully"
+log "Persistent success marker written: $MARKER"

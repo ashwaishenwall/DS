@@ -1,0 +1,69 @@
+name: devsecops-ci
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    environment: assessment-production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install -r verifier/requirements.txt pytest
+
+      - name: Terraform fmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform -chdir=terraform fmt -recursive
+
+      - name: Terraform init
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform -chdir=terraform validate
+
+      - name: Python tests
+        run: |
+          pytest -q verifier/test_verifier.py
+          python3 -m py_compile verifier/verifier.py
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Write Terraform variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > terraform/terraform.tfvars <<EOF
+          aws_region        = "${{ secrets.AWS_REGION }}"
+          project_name      = "fynd-devsecops"
+          ssh_key_name      = "${{ secrets.EC2_KEY_PAIR_NAME }}"
+          admin_cidr        = "${{ secrets.ADMIN_CIDR }}"
+          app_instance_type = "t3.medium"
+          wazuh_instance_type = "t3.medium"
+          wireguard_cidr    = "10.8.0.0/24"
+          EOF
+
+      - name: Provision AWS lab
+        run: terraform -chdir=terraform apply -auto-approve
+
+      - name: Show provisioned endpoints
+        run: terraform -chdir=terraform output

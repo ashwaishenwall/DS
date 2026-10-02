@@ -1,0 +1,23 @@
+server {
+    listen 8080;
+    server_name _;
+
+    modsecurity on;
+    modsecurity_rules_file /etc/modsecurity.d/modsecurity.conf;
+
+    # Custom deterministic rule is loaded before CRS.
+    include /etc/modsecurity.d/owasp-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf;
+
+    location / {
+        proxy_pass http://host.docker.internal:30080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /healthz {
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+}

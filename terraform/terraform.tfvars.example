@@ -1,0 +1,7 @@
+aws_region        = "us-east-1"
+project_name      = "fynd-devsecops"
+ssh_key_name      = "YOUR_EXISTING_EC2_KEYPAIR_NAME"
+admin_cidr        = "YOUR.PUBLIC.IP.ADDRESS/32"
+app_instance_type = "t3.medium"
+wazuh_instance_type = "t3.medium"
+wireguard_cidr    = "10.8.0.0/24"
