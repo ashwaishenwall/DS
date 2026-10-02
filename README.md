@@ -383,7 +383,8 @@ Never include:
 
 Public/private IPs should be shown only when technically useful and should be redacted for external sharing when not required.
 
-## 15. AI use
+NaN
+
 
 AI was used to accelerate boilerplate generation, documentation, configuration review, and test scaffolding. All generated code was reviewed and tested as part of the assessment.
 
