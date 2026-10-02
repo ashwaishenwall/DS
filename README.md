@@ -206,15 +206,22 @@ The verifier uses:
 
 ## 10. CI/CD
 
-GitHub Actions validates:
+The current .github/workflows/ci.yml performs the following in the deployment workflow:
 
 - Terraform fmt
+- Terraform init with -backend=false
 - Terraform validate
-- Python verifier test/syntax
-- Gitleaks
-- Trivy IaC configuration scan
+- Python verifier unit tests
+- Python syntax compilation
+- Protected AWS credential configuration
+- Terraform variable generation from GitHub secrets
+- Terraform apply
 
-Deployment runs only after the `checks` job succeeds on `main`; GitHub Actions uses the protected `assessment-production` environment for AWS credentials. The end-to-end acceptance path remains `deploy.sh`, which waits for readiness and runs the Wazuh Indexer verifier. Do not store long-lived AWS credentials in the repository.
+The repository also contains the recovery workflow under .github/workflows/recover.yml.
+
+Important: Trivy and Gitleaks are part of the intended DevSecOps submission/checklist, but the current ci.yml in this repository does not execute those two scans. If the evaluator expects them to be enforced as CI gates, add them as separate pre-deployment jobs/steps before final submission. This README deliberately reflects the current workflow rather than claiming checks that are not executed.
+
+AWS credentials are supplied through the protected assessment-production GitHub environment. Do not store long-lived credentials, private keys, Terraform state, or secrets in the repository.
 
 ## 11. Security
 
@@ -242,20 +249,139 @@ Target:
 
 Actual AWS cost depends on region, runtime, public IPv4, EBS, and account credits. Record the AWS Cost Explorer/credits evidence for the final submission and destroy the lab after assessment.
 
-## 14. Evidence checklist
+## 14. Verification & Evidence Checklist
 
-Capture redacted screenshots for:
+Capture fresh, redacted evidence from the final tested deployment. Do not use old IP addresses or stale screenshots.
 
-1. AWS VPC/EC2
-2. `kubectl get pods -n juice-shop`
-3. Juice Shop allowed request
-4. WAF blocked request (403)
-5. WireGuard connected
-6. Wazuh Dashboard
-7. Fresh Wazuh event containing the verifier marker
-8. `VERIFICATION PASSED`
-9. GitHub Actions checks passed
-10. Direct-origin access blocked
+### A. Infrastructure / Terraform
+
+    terraform -chdir=terraform output
+    ./deploy.sh /path/to/existing-ec2-key.pem
+
+Expected final output includes:
+
+    ==========================================
+    ACCEPTANCE VERIFIER PASSED
+    ==========================================
+
+### B. Application / K3s
+
+On the application VM:
+
+    sudo kubectl get nodes -o wide
+    sudo kubectl get pods -A
+    sudo kubectl -n juice-shop get svc,pods
+    sudo docker ps
+
+The K3s node and Juice Shop workload should be healthy/running.
+
+### C. WAF — allowed request
+
+    curl -i "http://<APP_PUBLIC_IP>:8080/"
+
+Expected: HTTP 200/3xx from Juice Shop.
+
+### D. WAF — deterministic block
+
+    curl -i "http://<APP_PUBLIC_IP>:8080/?id=1%20OR%201%3D1"
+
+Expected:
+
+    HTTP/1.1 403
+
+### E. Direct-origin protection
+
+    curl -i "http://<APP_PUBLIC_IP>:3000/"
+
+Expected: direct access is blocked/not reachable from the external path. The WAF remains the intended application ingress.
+
+### F. WAF logs
+
+    sudo docker ps
+    sudo systemctl is-active fynd-waf-log-bridge
+
+Review the corresponding ModSecurity/CRS event for the blocked request.
+
+### G. WireGuard / private access
+
+    sudo wg show
+    sudo systemctl is-active wg-quick@wg0
+
+Never expose private keys.
+
+### H. Wazuh services
+
+On the Wazuh VM:
+
+    sudo systemctl is-active wazuh-manager
+    sudo systemctl is-active wazuh-indexer
+    sudo systemctl is-active wazuh-dashboard
+    sudo /opt/fynd-devsecops/healthcheck.sh
+
+### I. Persistent Wazuh storage
+
+    findmnt /var/lib/wazuh-indexer
+    df -hT /var/lib/wazuh-indexer
+
+The Indexer data directory should be backed by the dedicated encrypted EBS volume.
+
+### J. Wazuh Agent / enrollment
+
+On the application VM:
+
+    sudo systemctl is-active wazuh-agent
+    sudo grep -E 'Connected to the server|Requesting a key' /var/ossec/logs/ossec.log | tail -10
+
+The agent should be connected to the Wazuh Manager.
+
+### K. Fresh Wazuh event and verifier
+
+The normal end-to-end path is:
+
+    ./deploy.sh /path/to/existing-ec2-key.pem
+
+The verifier:
+1. checks application readiness;
+2. creates a fresh FYND_VERIFIER_MARKER UUID;
+3. sends a benign marker request through the WAF;
+4. requires the deterministic SQLi probe to return HTTP 403;
+5. polls wazuh-alerts-* and wazuh-archives-* through the Indexer API;
+6. exits 0 only when the marker is found;
+7. exits 1 on timeout/failure.
+
+For a direct verifier run:
+
+    python3 -m pip install -r verifier/requirements.txt
+    export INDEXER_PASSWORD='...'
+    python3 verifier/verifier.py --app-url "http://<APP_PUBLIC_IP>:8080" --indexer-url "https://<WAZUH_PRIVATE_IP>:9200"
+
+### L. CI/CD evidence
+
+Capture the GitHub Actions run showing the checks actually executed by .github/workflows/ci.yml:
+
+- Terraform fmt
+- Terraform validate
+- Python tests
+- Python syntax compilation
+- protected AWS credential configuration
+- Terraform provisioning
+
+If Trivy/Gitleaks are added before final submission, capture their successful results as well.
+
+### M. Redaction rules
+
+Never include:
+
+- AWS access keys/secrets
+- GitHub secrets
+- Wazuh admin passwords
+- WireGuard private keys
+- EC2 private keys / PEM contents
+- Terraform state
+- tokens/cookies
+- unnecessary internal identifiers
+
+Public/private IPs should be shown only when technically useful and should be redacted for external sharing when not required.
 
 ## 15. AI use
 
@@ -273,11 +399,24 @@ The EC2 user-data scripts are idempotent for normal reruns:
 - Fresh Wazuh installations initialize OpenSearch Security automatically when required.
 - Readiness markers are created only after service/configuration health checks pass.
 
-## 17. Incomplete items
+## 17. Current Status / Known Gaps
 
-Update this section before submission. If all acceptance tests pass, write:
+The core lab implementation is in place: Terraform-managed AWS infrastructure, K3s/Juice Shop, ModSecurity/OWASP CRS, WireGuard, Wazuh Server/Indexer/Dashboard, persistent EBS, automated agent/log collection, and the Python Indexer verifier.
 
-`No known incomplete items. All assignment acceptance checks were executed and evidence is included.`
+Before final submission, perform one fresh end-to-end run and confirm:
+
+- deploy.sh completes successfully.
+- A fresh verifier marker is visible in Wazuh Indexer.
+- WAF allowed request returns 200/3xx.
+- Deterministic SQLi test returns 403.
+- Direct-origin access is blocked.
+- WireGuard private access works.
+- Wazuh Manager/Indexer/Dashboard are healthy.
+- Persistent Indexer storage is mounted.
+- CI checks pass.
+- Trivy and Gitleaks are explicitly present as CI gates if required by the evaluator.
+
+Do not state that there are no incomplete items until the final fresh acceptance run and evidence capture have been completed.
 
 ## 18. Teardown
 
